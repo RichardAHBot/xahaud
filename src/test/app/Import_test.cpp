@@ -29,7 +29,9 @@
 #include <xrpl/json/json_reader.h>
 #include <xrpl/json/json_writer.h>
 #include <xrpl/protocol/Feature.h>
+#include <xrpl/protocol/HashPrefix.h>
 #include <xrpl/protocol/Import.h>
+#include <xrpl/protocol/digest.h>
 #include <xrpl/protocol/jss.h>
 
 #define BEAST_REQUIRE(x)     \
@@ -334,9 +336,48 @@ class Import_test : public beast::unit_test::suite
                 tmpProof[jss::children]["3"];
             BEAST_EXPECT(syntaxCheckProof(tmpProof, env.journal) == false);
         }
+        // fix20260921 - tree node hash format
+        {
+            Json::Value tmpProof = proof;
+            tmpProof[jss::children]["3"][jss::hash] =
+                "ZZ126BA0486ADAE575BBC5335E42E236275A452037CA9A876D1A8CDACA1AE5"
+                "42";
+            BEAST_EXPECT(syntaxCheckProof(tmpProof, env.journal) == true);
+            BEAST_EXPECT(
+                syntaxCheckProof(tmpProof, env.journal, 0, true) == false);
+        }
+        // fix20260921 - tree node key format
+        {
+            Json::Value tmpProof = proof;
+            tmpProof[jss::children]["3"][jss::key] =
+                "ZZD6F6AB7D0A827DD1502B7B9571626A2B601DBE5BC786EF8ADD00E0CB7FCE"
+                "B3";
+            BEAST_EXPECT(syntaxCheckProof(tmpProof, env.journal) == true);
+            BEAST_EXPECT(
+                syntaxCheckProof(tmpProof, env.journal, 0, true) == false);
+        }
+        // fix20260921 - root hash format
+        {
+            Json::Value tmpProof = proof;
+            tmpProof[jss::hash] =
+                "ZZ9C8D073DDB5AB07FD2CD4F14467A8F3BC8FFBA16A0032D12D823D8511C12"
+                "F4";
+            BEAST_EXPECT(syntaxCheckProof(tmpProof, env.journal) == true);
+            BEAST_EXPECT(
+                syntaxCheckProof(tmpProof, env.journal, 0, true) == false);
+        }
+        // fix20260921 - child nibble format
+        {
+            Json::Value tmpProof = proof;
+            tmpProof[jss::children]["a"] = tmpProof[jss::children]["3"];
+            BEAST_EXPECT(syntaxCheckProof(tmpProof, env.journal) == true);
+            BEAST_EXPECT(
+                syntaxCheckProof(tmpProof, env.journal, 0, true) == false);
+        }
         // success
         {
             BEAST_EXPECT(syntaxCheckProof(proof, env.journal) == true);
+            BEAST_EXPECT(syntaxCheckProof(proof, env.journal, 0, true) == true);
         }
     }
 
@@ -1481,6 +1522,131 @@ class Import_test : public beast::unit_test::suite
             })json";
             Blob raw = Blob(strJson.begin(), strJson.end());
             BEAST_EXPECT(syntaxCheckXPOP(raw, env.journal).has_value() == true);
+        }
+    }
+
+    // Verify that the fix20260921 amendment enforces stricter proof
+    // validation. Pre-amendment the old behaviour is retained; post-amendment
+    // stricter checks reject malformed proofs.
+    static Json::Value
+    spoofInnerNode(Json::Value xpop, bool plant)
+    {
+        auto const rawTx =
+            *strUnHex(xpop[jss::transaction][jss::blob].asString());
+        auto const rawMeta =
+            *strUnHex(xpop[jss::transaction][jss::meta].asString());
+
+        STObject meta(SerialIter(rawMeta.data(), rawMeta.size()), sfMetadata);
+        meta.setFieldU32(
+            sfTransactionIndex, meta.getFieldU32(sfTransactionIndex) + 1);
+        Serializer ms;
+        meta.add(ms);
+        xpop[jss::transaction][jss::meta] = strHex(ms.peekData());
+
+        // recompute hash
+        STTx const stx(SerialIter(rawTx.data(), rawTx.size()));
+        Serializer s(rawTx.size() + ms.peekData().size() + 40);
+        s.addVL(rawTx);
+        s.addVL(ms.peekData());
+        s.addBitString(stx.getTransactionID());
+        uint256 const item = sha512Half(HashPrefix::txNode, s.slice());
+
+        // fixture-specific: intermediate node at nibble 0
+        if (plant)
+            xpop[jss::transaction][jss::proof][jss::children]["0"][jss::hash] =
+                strHex(item);
+
+        return xpop;
+    }
+
+    void
+    testProofInnerNodeSpoof(FeatureBitset features)
+    {
+        testcase("import proof inner node spoof - fix20260921");
+
+        using namespace test::jtx;
+        using namespace std::literals;
+
+        // modified proof: rejected both sides
+        for (bool const fixEnabled : {false, true})
+        {
+            test::jtx::Env env{
+                *this,
+                network::makeNetworkVLConfig(21337, keys),
+                fixEnabled ? features : features - fix20260921};
+
+            auto const alice = Account("alice");
+            env.memoize(alice);
+
+            Json::Value tx = import::import(
+                alice,
+                spoofInnerNode(
+                    import::loadXpop(ImportTCAccountSet::w_seed), false));
+            tx[jss::Sequence] = 0;
+            tx[jss::Fee] = 0;
+            env(tx, alice, ter(temMALFORMED));
+        }
+
+        // pre-amendment: old path
+        {
+            test::jtx::Env env{
+                *this,
+                network::makeNetworkVLConfig(21337, keys),
+                features - fix20260921};
+
+            auto const master = Account("masterpassphrase");
+            env(noop(master), fee(10'000'000'000), ter(tesSUCCESS));
+            env.close();
+
+            auto const alice = Account("alice");
+            env.memoize(alice);
+            auto const preAlice = env.balance(alice);
+            BEAST_EXPECT(preAlice == XRP(0));
+
+            Json::Value tx = import::import(
+                alice,
+                spoofInnerNode(
+                    import::loadXpop(ImportTCAccountSet::w_seed), true));
+            tx[jss::Sequence] = 0;
+            tx[jss::Fee] = 0;
+            env(tx, alice, ter(tesSUCCESS));
+            env.close();
+
+            // verify mint behaviour
+            bool const zeroBurn =
+                env.current()->rules().enabled(featureZeroB2M);
+            auto const totalBurn = XRP(zeroBurn ? 0 : 1000) + XRP(2);
+            BEAST_EXPECT(env.balance(alice) == preAlice + totalBurn);
+
+            auto const [acct, acctSle] =
+                accountKeyAndSle(*env.current(), alice);
+            BEAST_EXPECT(acctSle != nullptr);
+        }
+
+        // post-amendment: new path
+        {
+            test::jtx::Env env{
+                *this, network::makeNetworkVLConfig(21337, keys), features};
+
+            auto const master = Account("masterpassphrase");
+            env(noop(master), fee(10'000'000'000), ter(tesSUCCESS));
+            env.close();
+
+            auto const alice = Account("alice");
+            env.memoize(alice);
+
+            Json::Value tx = import::import(
+                alice,
+                spoofInnerNode(
+                    import::loadXpop(ImportTCAccountSet::w_seed), true));
+            tx[jss::Sequence] = 0;
+            tx[jss::Fee] = 0;
+            env(tx, alice, ter(temMALFORMED));
+            env.close();
+
+            auto const [acct, acctSle] =
+                accountKeyAndSle(*env.current(), alice);
+            BEAST_EXPECT(acctSle == nullptr);
         }
     }
 
@@ -6278,6 +6444,7 @@ public:
         testSyntaxCheckProofArray(features);
         testSyntaxCheckProofObject(features);
         testSyntaxCheckXPOP(features);
+        testProofInnerNodeSpoof(features);
         testGetVLInfo(features);
         testEnabled(features);
         testInvalidPreflight(features);

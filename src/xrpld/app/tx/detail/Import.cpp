@@ -161,8 +161,11 @@ Import::preflight(PreflightContext const& ctx)
         return temMALFORMED;
     }
 
+    // fix20260921: update proof handling.
+    bool const proofFix = ctx.rules.enabled(fix20260921);
+
     // parse blob as json
-    auto const xpop = syntaxCheckXPOP(tx.getFieldVL(sfBlob), ctx.j);
+    auto const xpop = syntaxCheckXPOP(tx.getFieldVL(sfBlob), ctx.j, proofFix);
 
     if (!xpop)
         return temMALFORMED;
@@ -481,13 +484,20 @@ Import::preflight(PreflightContext const& ctx)
         sha512Half(HashPrefix::txNode, s.slice());
 
     // check if the proof is inside the proof tree/list
-    if (!([](Json::Value const& proof, std::string hash) -> bool {
+    if (!([](Json::Value const& proof,
+             uint256 const& hash,
+             bool proofFix) -> bool {
+            // Retain pre-amendment comparison for backward compatibility.
+            std::string const hashHex = strHex(hash);
+
             auto const proofContains = [](Json::Value const* proof,
-                                          std::string hash,
-                                          int depth = 0,
-                                          auto proofContains =
-                                              nullptr) -> bool {
-                if (depth > 32)
+                                          uint256 const& hash,
+                                          std::string const& hashHex,
+                                          bool proofFix,
+                                          int depth,
+                                          auto proofContains) -> bool {
+                // Traversal limit.
+                if (depth > (proofFix ? 64 : 32))
                     return false;
 
                 if (!proof->isObject() && !proof->isArray())
@@ -505,19 +515,49 @@ Import::preflight(PreflightContext const& ctx)
                     if (entry->isNull())
                         continue;
 
-                    if ((entry->isString() && entry->asString() == hash) ||
-                        (entry->isObject() && entry->isMember(jss::hash) &&
-                         (*entry)[jss::hash] == hash) ||
-                        proofContains(entry, hash, depth + 1, proofContains))
+                    bool matched = false;
+
+                    if (proofFix)
+                    {
+                        // Post-amendment: matching rules updated.
+                        uint256 declared;
+
+                        if (entry->isString())
+                            matched = declared.parseHex(entry->asString()) &&
+                                declared == hash;
+                        else if (
+                            entry->isObject() &&
+                            (*entry)[jss::hash].isString() &&
+                            (*entry)[jss::children].size() == 0)
+                            matched = declared.parseHex(
+                                          (*entry)[jss::hash].asString()) &&
+                                declared == hash;
+                    }
+                    else
+                        matched = (entry->isString() &&
+                                   entry->asString() == hashHex) ||
+                            (entry->isObject() && entry->isMember(jss::hash) &&
+                             (*entry)[jss::hash] == hashHex);
+
+                    if (matched ||
+                        proofContains(
+                            entry,
+                            hash,
+                            hashHex,
+                            proofFix,
+                            depth + 1,
+                            proofContains))
                         return true;
                 }
 
                 return false;
             };
 
-            return proofContains(&proof, hash, 0, proofContains);
+            return proofContains(
+                &proof, hash, hashHex, proofFix, 0, proofContains);
         })((*xpop)[jss::transaction][jss::proof],
-           strHex(computed_tx_hash_and_meta)))
+           computed_tx_hash_and_meta,
+           proofFix))
     {
         JLOG(ctx.j.warn())
             << "Import: xpop proof did not contain the specified txn hash "
@@ -527,70 +567,111 @@ Import::preflight(PreflightContext const& ctx)
     }
 
     // compute the merkel root over the proof
-    uint256 const computedTxRoot = ([](Json::Value const& proof) -> uint256 {
-        auto hashProof = [](Json::Value const& proof,
-                            int depth = 0,
-                            auto const& hashProof = nullptr) -> uint256 {
-            const uint256 nullhash;
+    auto const computedTxRoot =
+        ([](Json::Value const& proof, bool proofFix) -> std::optional<uint256> {
+            auto hashProof =
+                [](Json::Value const& proof,
+                   bool proofFix,
+                   int depth,
+                   auto const& hashProof) -> std::optional<uint256> {
+                const uint256 nullhash;
 
-            if (depth > 32)
-                return nullhash;
+                // Post-amendment: hard-fail on parse errors.
+                if (depth > (proofFix ? 64 : 32))
+                    return proofFix ? std::optional<uint256>{}
+                                    : std::optional<uint256>{nullhash};
 
-            if (!proof.isObject() && !proof.isArray())
-                return nullhash;
+                if (!proof.isObject() && !proof.isArray())
+                    return proofFix ? std::optional<uint256>{}
+                                    : std::optional<uint256>{nullhash};
 
-            sha512_half_hasher h;
-            using beast::hash_append;
-            hash_append(h, ripple::HashPrefix::innerNode);
+                sha512_half_hasher h;
+                using beast::hash_append;
+                hash_append(h, ripple::HashPrefix::innerNode);
 
-            if (proof.isArray())
-            {
-                for (const auto& entry : proof)
+                if (proof.isArray())
                 {
-                    if (entry.isString())
+                    for (const auto& entry : proof)
                     {
-                        uint256 hash;
-                        if (hash.parseHex(entry.asString()))
-                            hash_append(h, hash);
+                        if (entry.isString())
+                        {
+                            uint256 hash;
+                            if (hash.parseHex(entry.asString()))
+                                hash_append(h, hash);
+                            else if (proofFix)
+                                return {};
+                        }
+                        else
+                        {
+                            auto const child = hashProof(
+                                entry, proofFix, depth + 1, hashProof);
+                            if (!child)
+                                return {};
+                            hash_append(h, *child);
+                        }
                     }
-                    else
-                        hash_append(h, hashProof(entry, depth + 1, hashProof));
                 }
-            }
-            else if (proof.isObject())
-            {
-                for (int x = 0; x < 16; ++x)
+                else if (proof.isObject())
                 {
-                    // Duplicate / Sanity
-                    std::string const nibble(1, "0123456789ABCDEF"[x]);
-                    if (!proof[jss::children].isMember(nibble))
-                        hash_append(h, nullhash);
-                    else if (
-                        proof[jss::children][nibble][jss::children].size() ==
-                        0u)
+                    for (int x = 0; x < 16; ++x)
                     {
-                        uint256 hash;
-                        if (hash.parseHex(
-                                proof[jss::children][nibble][jss::hash]
-                                    .asString()))
-                            hash_append(h, hash);
-                    }
-                    else
-                        hash_append(
-                            h,
-                            hashProof(
+                        // Duplicate / Sanity
+                        std::string const nibble(1, "0123456789ABCDEF"[x]);
+                        if (!proof[jss::children].isMember(nibble))
+                            hash_append(h, nullhash);
+                        else if (
+                            proof[jss::children][nibble][jss::children]
+                                .size() == 0u)
+                        {
+                            auto const& declared =
+                                proof[jss::children][nibble][jss::hash];
+                            uint256 hash;
+                            if (declared.isString() &&
+                                hash.parseHex(declared.asString()))
+                                hash_append(h, hash);
+                            else if (proofFix)
+                                return {};
+                        }
+                        else
+                        {
+                            auto const child = hashProof(
                                 proof[jss::children][nibble],
+                                proofFix,
                                 depth + 1,
-                                hashProof));
+                                hashProof);
+                            if (!child)
+                                return {};
+                            hash_append(h, *child);
+                        }
+                    }
                 }
-            }
-            return static_cast<uint256>(h);
-        };
-        return hashProof(proof, 0, hashProof);
-    })((*xpop)[jss::transaction][jss::proof]);
+                return static_cast<uint256>(h);
+            };
+            return hashProof(proof, proofFix, 0, hashProof);
+        })((*xpop)[jss::transaction][jss::proof], proofFix);
+
+    if (!computedTxRoot)
+    {
+        JLOG(ctx.j.warn()) << "Import: could not compute txroot over the xpop "
+                              "proof, invalid xpop. "
+                           << tx.getTransactionID();
+        return temMALFORMED;
+    }
 
     auto const& lgr = (*xpop)[jss::ledger];
-    if (strHex(computedTxRoot) != lgr[jss::txroot])
+
+    // Post-amendment: txroot comparison updated.
+    bool txRootMatches = false;
+    if (proofFix)
+    {
+        uint256 declaredTxRoot;
+        txRootMatches = declaredTxRoot.parseHex(lgr[jss::txroot].asString()) &&
+            declaredTxRoot == *computedTxRoot;
+    }
+    else
+        txRootMatches = strHex(*computedTxRoot) == lgr[jss::txroot];
+
+    if (!txRootMatches)
     {
         JLOG(ctx.j.warn()) << "Import: computed txroot does not match xpop "
                               "txroot, invalid xpop. "
@@ -617,7 +698,7 @@ Import::preflight(PreflightContext const& ctx)
         std::uint32_t(lgr[jss::index].asUInt()),
         *coins,
         phash,
-        computedTxRoot,
+        *computedTxRoot,
         acroot,
         std::uint32_t(lgr[jss::pclose].asUInt()),
         std::uint32_t(lgr[jss::close].asUInt()),
@@ -1075,9 +1156,9 @@ Import::doSignerList(std::shared_ptr<SLE>& sle, STTx const& stpTrans)
     // validate signer list
     //
 
-    JLOG(ctx_.journal.warn()) << "Import: actioning SignerListSet "
-                              << "quorum: " << quorum << " "
-                              << "size: " << signers.size();
+    JLOG(ctx_.journal.warn())
+        << "Import: actioning SignerListSet " << "quorum: " << quorum << " "
+        << "size: " << signers.size();
 
     if (SetSignerList::validateQuorumAndSignerEntries(
             quorum, signers, id, ctx_.journal, ctx_.view().rules()) !=
@@ -1134,8 +1215,8 @@ Import::doRegularKey(std::shared_ptr<SLE>& sle, STTx const& stpTrans)
     if (!stpTrans.isFieldPresent(sfRegularKey))
     {
         // delete op
-        JLOG(ctx_.journal.trace()) << "Import: clearing SetRegularKey "
-                                   << " acc: " << id;
+        JLOG(ctx_.journal.trace())
+            << "Import: clearing SetRegularKey " << " acc: " << id;
         if (sle->isFieldPresent(sfRegularKey))
             sle->makeFieldAbsent(sfRegularKey);
         return;

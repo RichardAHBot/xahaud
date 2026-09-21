@@ -63,11 +63,13 @@ parse_uint64(std::string const& str)
     return {};
 }
 
+// Additional structural checks gated by fix20260921.
 inline bool
 syntaxCheckProof(
     Json::Value const& proof,
     beast::Journal const& j,
-    int depth = 0)
+    int depth = 0,
+    bool strict = false)
 {
     if (depth > 64)
     {
@@ -100,7 +102,7 @@ syntaxCheckProof(
             }
             else if (entry.isArray())
             {
-                if (!syntaxCheckProof(entry, j, depth + 1))
+                if (!syntaxCheckProof(entry, j, depth + 1, strict))
                     return false;
             }
             else
@@ -127,7 +129,17 @@ syntaxCheckProof(
                 return false;
             }
 
-            return syntaxCheckProof(proof["children"], j, depth + 1);
+            // Post-amendment: extra structural validation on tree-form fields.
+            if (strict &&
+                (!isHex(proof["hash"].asString()) ||
+                 !isHex(proof["key"].asString())))
+            {
+                JLOG(j.warn()) << "XPOP.transaction.proof tree node hash or "
+                                  "key was not hex (root)";
+                return false;
+            }
+
+            return syntaxCheckProof(proof["children"], j, depth + 1, strict);
         }
 
         for (const auto& branch : proof.getMemberNames())
@@ -137,6 +149,16 @@ syntaxCheckProof(
                 JLOG(j.warn())
                     << "XPOP.transaction.proof child node was not 0-F "
                        "hex nibble";
+                return false;
+            }
+
+            // Post-amendment: enforce canonical nibble form.
+            if (strict &&
+                branch.find_first_not_of("0123456789ABCDEF") !=
+                    std::string::npos)
+            {
+                JLOG(j.warn()) << "XPOP.transaction.proof child node nibble "
+                                  "was not upper case";
                 return false;
             }
 
@@ -151,7 +173,16 @@ syntaxCheckProof(
                     << "XPOP.transaction.proof tree node has wrong format";
                 return false;
             }
-            if (!syntaxCheckProof(node["children"], j, depth + 1))
+            if (strict &&
+                (!isHex(node["hash"].asString()) ||
+                 !isHex(node["key"].asString())))
+            {
+                JLOG(j.warn()) << "XPOP.transaction.proof tree node hash or "
+                                  "key was not hex";
+                return false;
+            }
+
+            if (!syntaxCheckProof(node["children"], j, depth + 1, strict))
             {
                 JLOG(j.warn()) << "XPOP.transaction.proof bad children format";
                 return false;
@@ -170,7 +201,7 @@ syntaxCheckProof(
 
 // does not check signature etc
 inline std::optional<Json::Value>
-syntaxCheckXPOP(Blob const& blob, beast::Journal const& j)
+syntaxCheckXPOP(Blob const& blob, beast::Journal const& j, bool strict = false)
 {
     if (blob.empty())
         return {};
@@ -313,7 +344,7 @@ syntaxCheckXPOP(Blob const& blob, beast::Journal const& j)
             return {};
         }
 
-        if (!syntaxCheckProof(xpop["transaction"]["proof"], j))
+        if (!syntaxCheckProof(xpop["transaction"]["proof"], j, 0, strict))
         {
             JLOG(j.warn()) << "XPOP.transaction.proof failed syntax check "
                               "(tree/list form)";
