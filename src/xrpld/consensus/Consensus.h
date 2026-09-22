@@ -1318,8 +1318,7 @@ Consensus<Adaptor>::phaseOpen(std::unique_ptr<std::stringstream> const& clog)
         idleInterval = adaptor_.parms().bootstrapRoundTimeSeed;
     }
     CLOG(clog) << "idle interval set to " << idleInterval.count()
-               << "ms based on "
-               << "ledgerIDLE_INTERVAL: "
+               << "ms based on " << "ledgerIDLE_INTERVAL: "
                << adaptor_.parms().ledgerIDLE_INTERVAL.count()
                << ", previous ledger close time resolution: "
                << previousLedger_.closeTimeResolution().count() << "ms"
@@ -1386,8 +1385,7 @@ Consensus<Adaptor>::shouldPause(
          << "roundTime: " << result_->roundTime.read().count() << ", "
          << "max consensus time: " << parms.ledgerMAX_CONSENSUS.count() << ", "
          << "validators: " << totalValidators << ", "
-         << "laggards: " << laggards << ", "
-         << "offline: " << offline << ", "
+         << "laggards: " << laggards << ", " << "offline: " << offline << ", "
          << "quorum: " << quorum << ")";
 
     if (!ahead || !laggards || !totalValidators || !adaptor_.validator() ||
@@ -1867,8 +1865,8 @@ Consensus<Adaptor>::updateOurPositions(
         if (!haveCloseTimeConsensus_)
         {
             JLOG(j_.debug())
-                << "No CT consensus:"
-                << " Proposers:" << currPeerPositions_.size()
+                << "No CT consensus:" << " Proposers:"
+                << currPeerPositions_.size()
                 << " Mode:" << to_string(mode_.get())
                 << " Thresh:" << threshConsensus
                 << " Pos:" << consensusCloseTime.time_since_epoch().count();
