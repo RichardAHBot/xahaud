@@ -21,20 +21,14 @@ echo "=== Using temp directory: /io/tmp ==="
 
 umask 0000;
 
-cd /io/ &&
-echo "Importing env... Lines:" &&
-cat .env|wc -l &&
-source .env
-
-echo $?
-if [[ "$?" -ne "0" ]]; then
-  echo "ERR no .env found/sourced"
-  exit 127
-fi
+cd /io/
+echo "Importing env... Lines:"
+cat .env|wc -l
+source .env || { echo "ERR no .env found/sourced"; exit 127; }
 
 BUILD_TYPE=Release
 
-mv cmake/deps/WasmEdge.cmake cmake/deps/WasmEdge.old &&
+mv cmake/deps/WasmEdge.cmake cmake/deps/WasmEdge.old
 echo "find_package(LLVM REQUIRED CONFIG)
 message(STATUS \"Found LLVM \${LLVM_PACKAGE_VERSION}\")
 message(STATUS \"Using LLVMConfig.cmake in: \${LLVM_DIR}\")
@@ -43,25 +37,33 @@ set_target_properties(wasmedge PROPERTIES IMPORTED_LOCATION \${WasmEdge_LIB})
 target_link_libraries (ripple_libs INTERFACE wasmedge)
 add_library (wasmedge::wasmedge ALIAS wasmedge)
 message(\"WasmEdge DONE\")
-" > cmake/deps/WasmEdge.cmake &&
+" > cmake/deps/WasmEdge.cmake
 
 export LDFLAGS="-static-libstdc++"
 export CMAKE_EXE_LINKER_FLAGS="-static-libstdc++"
 export CMAKE_STATIC_LINKER_FLAGS="-static-libstdc++"
 
-git config --global --add safe.directory /io &&
-git checkout src/libxrpl/protocol/BuildInfo.cpp &&
-sed -i s/\"0.0.0\"/\"$(date +%Y).$(date +%-m).$(date +%-d)-$(git rev-parse --abbrev-ref HEAD)$(if [ -n "$4" ]; then echo "+$4"; fi)\"/g src/libxrpl/protocol/BuildInfo.cpp  &&
-conan export external/snappy --version 1.1.10 --user xahaud --channel stable &&
-conan export external/soci --version 4.0.3 --user xahaud --channel stable &&
-cd release-build &&
+git config --global --add safe.directory /io
+git checkout src/libxrpl/protocol/BuildInfo.cpp
+
+# Use | as sed delimiter to handle branch names with / in them
+BRANCH_NAME=$(git rev-parse --abbrev-ref HEAD)
+VERSION_SUFFIX=""
+if [ -n "$4" ]; then VERSION_SUFFIX="+$4"; fi
+sed -i "s|\"0.0.0\"|\"$(date +%Y).$(date +%-m).$(date +%-d)-${BRANCH_NAME}${VERSION_SUFFIX}\"|g" src/libxrpl/protocol/BuildInfo.cpp
+
+conan export external/snappy --version 1.1.10 --user xahaud --channel stable
+conan export external/soci --version 4.0.3 --user xahaud --channel stable
+cd release-build
+
 # Install dependencies - tool_requires in conanfile.py handles glibc 2.28 compatibility
 # for build tools (protoc, grpc plugins, b2) in HBB environment
 # The tool_requires('b2/5.3.2') in conanfile.py should force b2 to build from source
 # with the correct toolchain, avoiding the GLIBCXX_3.4.29 issue
-echo "=== Installing dependencies ===" &&
-conan install .. --output-folder . --build missing --settings build_type=$BUILD_TYPE \
-  -o with_wasmedge=False -o tool_requires_b2=True &&
+echo "=== Installing dependencies ==="
+conan install .. --output-folder . --build missing --build "b2/*" --build "m4/*" --settings build_type=$BUILD_TYPE \
+  -o with_wasmedge=False -o tool_requires_b2=True
+
 cmake .. -G Ninja \
   -DCMAKE_BUILD_TYPE=$BUILD_TYPE \
   -DCMAKE_TOOLCHAIN_FILE:FILEPATH=build/generators/conan_toolchain.cmake \
@@ -69,26 +71,34 @@ cmake .. -G Ninja \
   -DLLVM_DIR=$LLVM_DIR \
   -DWasmEdge_LIB=$WasmEdge_LIB \
   -Dxrpld=TRUE \
-  -Dtests=TRUE &&
-ccache -z &&
-ccache -p &&
-ninja -j $3 && echo "=== Re-running final link with verbose output ===" && rm -f rippled && ninja -v rippled &&
-ccache -s &&
-strip -s rippled &&
-mv rippled xahaud &&
-echo "=== Full ldd output ===" &&
-ldd xahaud &&
-echo "=== Running libcheck ===" &&
-libcheck xahaud &&
-echo "Build host: `hostname`" > release.info &&
-echo "Build date: `date`" >> release.info &&
-echo "Build md5: `md5sum xahaud`" >> release.info &&
-echo "Git remotes:" >> release.info && 
-git remote -v >> release.info &&
-echo "Git status:" >> release.info &&
-git status -v >> release.info &&
-echo "Git log [last 20]:" >> release.info &&
-git log -n 20 >> release.info;
+  -Dtests=TRUE
+
+ccache -z
+ccache -p
+ninja -j $3
+
+echo "=== Re-running final link with verbose output ==="
+rm -f rippled
+ninja -v rippled
+
+ccache -s
+strip -s rippled
+mv rippled xahaud
+
+echo "=== Full ldd output ==="
+ldd xahaud
+echo "=== Running libcheck ==="
+libcheck xahaud
+
+echo "Build host: `hostname`" > release.info
+echo "Build date: `date`" >> release.info
+echo "Build md5: `md5sum xahaud`" >> release.info
+echo "Git remotes:" >> release.info
+git remote -v >> release.info
+echo "Git status:" >> release.info
+git status -v >> release.info
+echo "Git log [last 20]:" >> release.info
+git log -n 20 >> release.info
 
 if [[ "$4" == "" ]]; then
   # Non GH, local building
@@ -104,16 +114,16 @@ else
         echo "building non-release branch, placing it in builds root"
         cp /io/release-build/xahaud /data/builds/$(date +%Y).$(date +%-m).$(date +%-d)-$(git rev-parse --abbrev-ref HEAD)+$4
         cp /io/release-build/release.info /data/builds/$(date +%Y).$(date +%-m).$(date +%-d)-$(git rev-parse --abbrev-ref HEAD)+$4.releaseinfo
-    fi  
+    fi
   echo "Published build to: http://build.xahau.tech/"
   echo $(date +%Y).$(date +%-m).$(date +%-d)-$(git rev-parse --abbrev-ref HEAD)+$4
 fi
 
-cd ..;
+cd ..
 
-mv src/xrpld/net/detail/RegisterSSLCerts.cpp.old src/xrpld/net/detail/RegisterSSLCerts.cpp;
-mv cmake/deps/WasmEdge.old cmake/deps/WasmEdge.cmake;
-rm src/certs/certbundle.h;
-git checkout src/libxrpl/protocol/BuildInfo.cpp;
+mv src/xrpld/net/detail/RegisterSSLCerts.cpp.old src/xrpld/net/detail/RegisterSSLCerts.cpp
+mv cmake/deps/WasmEdge.old cmake/deps/WasmEdge.cmake
+rm src/certs/certbundle.h
+git checkout src/libxrpl/protocol/BuildInfo.cpp
 
 echo "END INSIDE CONTAINER - CORE"

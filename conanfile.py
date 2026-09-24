@@ -118,6 +118,8 @@ class Xrpl(ConanFile):
         # Force boost version for all dependencies to avoid conflicts
         self.requires('boost/1.86.0', override=True)
         self.requires('lz4/1.10.0', force=True)
+        # Pin libcurl to version compatible with Conan 2.19.1 in HBB (Python 3.6 EOL)
+        self.requires('libcurl/8.1.2', override=True)
 
         if self.options.with_wasmedge:
             self.requires('wasmedge/0.11.2@xahaud/stable')
